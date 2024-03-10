@@ -1,0 +1,145 @@
+name: Explicit Firmware at GHA
+
+on:
+  push:
+#  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-firmware:
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Arm GNU Toolchain (arm-none-eabi-gcc)
+        if: ${{ env.skip != 'true' }}
+        uses: carlosperate/arm-none-eabi-gcc-action@v1
+        with:
+          release: '12.3.Rel1'
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '11'
+
+      - name: Test Compiler
+        run: javac -version
+
+      - name: Discover cores
+        if: ${{ matrix.os != 'macos-latest' }}
+        run: lscpu | egrep 'Model name|Socket|Thread|NUMA|CPU\(s\)'
+
+      - name: Install required software (ubuntu)
+        if: ${{ matrix.os != 'macos-latest' }}
+        run: |
+          sudo bash ext/gerefi/misc/actions/add-ubuntu-latest-apt-mirrors.sh
+          sudo apt-get install sshpass sshpass mtools
+
+      - name: Install required software (macos)
+        if: ${{ matrix.os == 'macos-latest' }}
+        run: |
+          brew install mtools zip dosfstools flock
+
+      - name: Removing other .ini files since we will be uploading
+        working-directory: ext/gerefi/
+        run: rm -rf firmware/tunerstudio/generated/*.ini
+
+      - name: Gen Config
+        working-directory: ext/gerefi/firmware
+        run: |
+          bash gen_config_board.sh ../../.. paralela
+
+      - name: Config Status
+        working-directory: ext/gerefi
+        run: |
+          git status
+
+      - name: Push Config
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub git update Action"
+          git add generated/*
+          OUT=$(git commit -am "GHA Automation" 2>&1) || echo "commit failed, finding out why"
+          if echo "$OUT" | grep 'nothing to commit'; then
+            echo "Configs: looks like nothing to commit"
+            exit 0
+          fi
+          git status
+
+      - name: Connectors Status
+        run: |
+          git status
+
+      - name: Push Connectors
+        run: |
+          git add connectors/*
+          OUT=$(git commit -am "GHA Connectors Generated" 2>&1) || echo "commit failed, finding out why"
+          if echo "$OUT" | grep 'nothing to commit'; then
+            echo "Connectors: looks like nothing to commit"
+            exit 0
+          fi
+
+      - name: Push
+        uses: ad-m/github-push-action@master
+        with:
+          github_token: ${{ github.token }}
+
+      - name: Upload .ini files to server
+        working-directory: ext/gerefi/firmware/tunerstudio/generated
+        run: ../upload_ini.sh gerefi_paralela.ini ${{ secrets.gerefi_ONLINE_FTP_USER }} ${{ secrets.gerefi_ONLINE_FTP_PASS }} ${{ secrets.gerefi_FTP_SERVER }}
+
+      - name: Build Firmware
+        working-directory: ext/gerefi
+        run: bash misc/jenkins/compile_other_versions/compile.sh ../../.. paralela
+
+      - name: Upload build bin artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: gerefi.bin
+          path: ext/gerefi/firmware/deliver/gerefi*.bin
+
+      - name: Upload build hex artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: gerefi.hex
+          path: ext/gerefi/firmware/deliver/gerefi*.hex
+
+      - name: Upload build map artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: gerefi.map
+          path: ext/gerefi/firmware/deliver/gerefi*.map
+
+      - name: Build console
+        working-directory: ext/gerefi/
+        run: bash misc/jenkins/build_java_console.sh
+
+      - name: Set SSH variables
+        env:
+          ACTIONS_ALLOW_UNSECURE_COMMANDS: 'true'
+        run: |
+          if [ "${{github.event_name}}" = "push" ] && [ "${{github.ref}}" = "refs/heads/master" ]; then
+            echo "Setting credentials..."
+            echo "gerefi_SSH_SERVER=${{secrets.gerefi_SSH_SERVER}}" >> $GITHUB_ENV
+            echo "gerefi_SSH_USER=${{secrets.gerefi_SSH_USER}}" >> $GITHUB_ENV
+            echo "gerefi_SSH_PASS=${{secrets.gerefi_SSH_PASS}}" >> $GITHUB_ENV
+          else
+            echo "NOT setting credentials: ${{github.event_name}} ${{github.ref}}"
+          fi
+
+      - name: Package and Upload Bundle
+        working-directory: ext/gerefi/
+        run: bash misc/jenkins/compile_other_versions/prepare_bundle.sh paralela gerefi_paralela.ini master
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: gerefi_bundle_paralela.zip
+          path: ext/gerefi/artifacts/gerefi_bundle*.zip
